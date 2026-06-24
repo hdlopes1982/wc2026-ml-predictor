@@ -1,0 +1,18 @@
+# Modelos
+models/*.pkl
+
+# Datasets gerados automaticamente pelos notebooks
+data/results_clean.csv
+data/fifa_ranking.csv
+data/df_train.csv
+data/df_full.csv
+data/df_wc_predict.csv
+
+# Ficheiros Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# OneDrive
+desktop.ini
+*.tmp

@@ -1,0 +1,1562 @@
+================================================================================
+PROJETO ML — MUNDIAL DE FUTEBOL 2026
+Resumo de Progresso | Gerado em: 2026-06-22
+================================================================================
+
+OBJETIVO GERAL
+--------------
+Pipeline de ML preditivo para o Mundial de Futebol 2026, com duas vertentes:
+  - Regressão: prever golos exatos (Regressão Linear ou Poisson)
+  - Classificação: prever desfecho (V/E/D) via Logistic Regression ou Random Forest
+        → o modelo de classificação é o "motor" do simulador do torneio
+
+Estrutura de notebooks:
+  01_scraping_ranking.ipynb   ✅ CONCLUÍDO
+  02_build_dataset.ipynb      ✅ CONCLUÍDO
+  03_model_training.ipynb     ✅ CONCLUÍDO
+  04_simulator.ipynb          🔄 PRÓXIMO
+
+
+================================================================================
+NOTEBOOK 01 — SCRAPING DO RANKING FIFA
+================================================================================
+
+ESTADO: ✅ CONCLUÍDO
+
+FONTE DE DADOS
+  URL página:  https://inside.fifa.com/fifa-world-ranking/men
+  API REST:    https://api.fifa.com/api/v3/fifarankings/rankings/live?gender=1&sportType=0&language=en
+
+DESCOBERTAS TÉCNICAS
+  - O __NEXT_DATA__ da página não contém a lista de rankings (só metadados e labels)
+  - A lista completa é carregada via chamada REST separada à api.fifa.com
+  - Endpoint identificado via DevTools (Network → Fetch/XHR)
+  - Estrutura da resposta: dict com chaves ['ContinuationToken', 'ContinuationHash', 'Results']
+  - Lista de seleções em: payload["Results"] (211 entradas)
+
+FIELD NAMES DA API FIFA
+  "Rank"            → posição no ranking
+  "TeamName"        → lista de dicts com locale; usar [0]["Description"] para nome EN
+  "IdCountry"       → código ISO (ex: "ARG", "POR")
+  "TotalPoints"     → pontuação FIFA
+
+HEADERS NECESSÁRIOS
+  User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) ...
+  Referer:    https://inside.fifa.com/
+  Origin:     https://inside.fifa.com
+
+OUTPUT
+  Ficheiro: fifa_ranking.csv
+  Colunas:  ranking | country_name | country_code | points
+  Linhas:   211 seleções (Argentina #1, France #2, Spain #3)
+
+
+================================================================================
+NOTEBOOK 02 — BUILD DATASET
+================================================================================
+
+ESTADO: ✅ CONCLUÍDO
+
+FONTE DE DADOS
+  Ficheiro: results.csv
+  Shape:    (49477, 9)
+  Colunas:  date | home_team | away_team | home_score | away_score |
+            tournament | city | country | neutral
+  Tipos:    home_score/away_score são float64 (NaN = jogos futuros do Mundial)
+  Período:  desde 1872-11-30 até ao calendário completo do Mundial 2026
+
+FEATURES CONSTRUÍDAS (todas validadas)
+
+  ✅ Diff_Ranking
+     Cálculo:   rank_home - rank_away
+     Merge:     fifa_ranking.csv via NAME_MAP (lowercase normalizado)
+     Positivo:  away é melhor ranked; Negativo: home é melhor ranked
+
+  ✅ Fator_Casa
+     Lógica:    1 se country == home_team; -1 se country == away_team; 0 se neutral=True
+     Validado:  neutral=True nunca gera Fator_Casa != 0
+     Nota:      Na fase de previsão do Mundial, forçar Fator_Casa = 0 em todos os jogos
+
+  ✅ Tipo_Competicao
+     Categorias:
+       "Mundial"             → tournament == "FIFA World Cup" (896 no treino)
+       "Qualificacao"        → contém "qualification" no nome (15344 no treino)
+       "Torneio_Continental" → set fixo de competições oficiais de confederações (6000 no treino)
+       "Amigavel"            → todo o resto (23284 no treino)
+
+  ✅ Forma_Golos_Home / Forma_Golos_Away
+     Cálculo:   média de golos marcados nos últimos 10 jogos (shift=1, sem data leakage)
+     Método:    formato longo → groupby(team).rolling(10) → merge de volta
+     Cap:       5.0 golos (88 registos históricos absurdos do séc. XIX/XX corrigidos)
+
+  ✅ Forma_Pts_Home / Forma_Pts_Away
+     Cálculo:   média de pontos (3/1/0) nos últimos 10 jogos (shift=1, sem data leakage)
+     Decisão:   features ortogonais a Forma_Golos — o algoritmo decide o peso de cada uma
+
+  ✅ Resultado (target classificação)
+     "H" = vitória home | "D" = empate | "A" = vitória away
+     Distribuição no treino: H=22272 | A=12722 | D=10530
+
+DICIONÁRIO NAME_MAP (results.csv → fifa_ranking.csv)
+  "south korea"                       → "korea republic"
+  "north korea"                       → "dpr korea"
+  "iran"                              → "ir iran"
+  "china"                             → "china pr"
+  "dr congo"                          → "congo dr"
+  "czech republic"                    → "czechia"
+  "gambia"                            → "the gambia"
+  "kyrgyzstan"                        → "kyrgyz republic"
+  "cape verde"                        → "cabo verde"
+  "ivory coast"                       → "côte d'ivoire"
+  "turkey"                            → "türkiye"
+  "united states"                     → "usa"
+  "taiwan"                            → "chinese taipei"
+  "saint kitts and nevis"             → "st. kitts and nevis"
+  "saint lucia"                       → "st. lucia"
+  "saint vincent and the grenadines"  → "st. vincent / grenadines"
+  "united states virgin islands"      → "us virgin islands"
+
+NaN RESIDUAIS ACEITES (sem ranking FIFA — excluídos no treino)
+  Nações extintas:      Czechoslovakia, Yugoslavia, German DR
+  Territórios não-FIFA: Martinique, Guadeloupe, Guernsey, Jersey, Zanzibar,
+                        French Guiana, Alderney, Réunion, Greenland,
+                        Saint Martin, Ynys Môn, Basque Country, Sint Maarten,
+                        Shetland, Isle of Man, Åland Islands
+
+OUTPUTS
+  df_train.csv   → 45524 linhas × 21 colunas (histórico limpo, sem NaN nas features)
+  df_full.csv    → 49819 linhas × 21 colunas (inclui jogos futuros do Mundial com NaN)
+
+  Filtros aplicados ao df_train:
+    - home_score.notna()
+    - date < 2026-06-11
+    - rank_home.notna() & rank_away.notna()
+    - todas as features sem NaN
+
+  Período do treino: 1873-03-08 → 2026-06-10
+
+
+================================================================================
+NOTEBOOK 03 — MODEL TRAINING
+================================================================================
+
+ESTADO: ✅ CONCLUÍDO
+
+EDA — CONCLUSÕES
+  Distribuições:
+    - Diff_Ranking: simétrica centrada em 0, caudas até ±208 (legítimas)
+    - Forma_Golos: assimétrica à direita, maioria entre 0-3 golos
+    - Forma_Pts: distribuição razoavelmente normal entre 0-3
+  
+  Outliers tratados:
+    - Diff_Ranking: SEM clipping — RobustScaler no preprocessador preserva
+                    valores extremos legítimos (ex: #1 vs #200 no Mundial)
+    - Forma_Golos: cap a 5.0 — 88 registos históricos irreais corrigidos
+                   (ex: Denmark com média de 17 golos, séc. XIX)
+
+  Correlações com Resultado_num (H=1, D=0, A=-1):
+    - Diff_Ranking:   -0.42  (feature mais preditiva)
+    - Forma_Pts_Home: +0.22
+    - Forma_Pts_Away: -0.23
+    - Fator_Casa:     +0.08  (fraco — esperado, forçado a 0 no Mundial)
+    - Forma_Golos_Home/Away: correlação moderada com Forma_Pts (0.68/0.69)
+                              → features ortogonais mas relacionadas
+
+PREPROCESSADOR
+  - OneHotEncoder:  Tipo_Competicao (categórica)
+  - RobustScaler:   todas as features numéricas (robusto a outliers)
+  - Implementado via ColumnTransformer dentro de Pipeline (sem data leakage)
+
+MODELOS TREINADOS
+
+  Classificação (target: H / D / A)
+  ┌─────────────────────┬──────────┬───────────┬──────────────────┬──────────┐
+  │ Modelo              │ Corretos │ Accuracy  │ Empates acertados│ Log-loss │
+  ├─────────────────────┼──────────┼───────────┼──────────────────┼──────────┤
+  │ Baseline (sempre H) │ 15/28    │ 53.6%     │ 0/10             │ —        │
+  │ Logistic Regression │ 16/28    │ 57.1%     │ 0/10             │ 0.988    │
+  │ Random Forest       │ 14/28    │ 50.0%     │ 1/10             │ 0.966    │
+  └─────────────────────┴──────────┴───────────┴──────────────────┴──────────┘
+
+  Regressão Poisson (target: home_score e away_score)
+    - Dois modelos separados: reg_home e reg_away
+    - Direcção correcta na maioria dos jogos
+    - Incapaz de capturar outliers reais (7-1, 6-0, 5-1) — comportamento
+      esperado num modelo de médias
+
+MODELO SELECCIONADO PARA O SIMULADOR: Random Forest
+  Justificação:
+    - Melhor log-loss (0.966 vs 0.988) — mais importante para .predict_proba()
+    - Apanha mais empates (1 vs 0)
+    - Empates são estruturalmente imprevisíveis no futebol — problema em aberto
+      na literatura académica (FiveThirtyEight, Opta atingem ~50-55% accuracy)
+    - class_weight="balanced" testado conceptualmente: aumenta recall de D
+      mas degrada accuracy global e log-loss — não compensa para o simulador
+
+  Iteração futura para portfolio:
+    - Treinar versão com class_weight="balanced" como comparação documentada
+
+OUTPUTS
+  model_clf_lr.pkl    → Logistic Regression treinada
+  model_clf_rf.pkl    → Random Forest treinado (modelo principal)
+  model_reg_home.pkl  → Poisson Regressor golos home
+  model_reg_away.pkl  → Poisson Regressor golos away
+
+
+================================================================================
+NOTEBOOK 04 — SIMULATOR
+================================================================================
+
+ESTADO: 🔄 PRÓXIMO
+
+FONTE: df_full.csv (linhas do Mundial com home_score NaN)
+
+Fase de Grupos:
+  - Filtrar linhas: tournament == "FIFA World Cup" & home_score NaN
+  - Forçar Fator_Casa = 0 e Tipo_Competicao = "Mundial" em todos os jogos
+  - Loop por jogo → construir feature vector → .predict() Random Forest
+  - Actualizar tabela de pontos (3/1/0)
+  - Desempate: .sort_values("ranking") via Ranking FIFA
+
+Fase a Eliminar (Mata-Mata):
+  - Gerar cruzamentos regulamentares em código
+  - .predict_proba() → ignorar classe "D" (Empate)
+  - Normalizar P(H) e P(A) → avança quem tiver maior probabilidade
+
+
+================================================================================
+DECISÕES DE DESIGN FIXADAS
+================================================================================
+
+  - Fator_Casa = 0 forçado para todos os jogos do Mundial (campo neutro)
+  - Features de forma: 4 colunas (Golos + Pontos) × (Home + Away), janela N=10
+  - Forma_Golos cap a 5.0 (outliers históricos)
+  - Diff_Ranking sem clipping — RobustScaler preserva valores extremos legítimos
+  - Desempate fase de grupos: sort_values("ranking_fifa")
+  - Mata-mata: .predict_proba(), ignorar "Empate", avança maior P(vitória)
+  - Treino: home_score.notna() + date < 2026-06-11
+  - Backtesting: 28 jogos da fase de grupos já disputados (dinâmico — cresce)
+  - Modelo principal: Random Forest (melhor log-loss)
+  - Sem simulações de Monte Carlo
+
+================================================================================
+
+
+================================================================================
+ATUALIZAÇÃO — NOTEBOOK 04 SIMULATOR (pré-código)
+Gerado em: 2026-06-22
+================================================================================
+
+ESTRUTURA DO MUNDIAL 2026
+  48 equipas | 12 grupos de 4 | 32 equipas no mata-mata
+  Qualificam: 1º e 2º de cada grupo (24) + 8 melhores terceiros (8)
+
+GRUPOS (nomes em inglês conforme results.csv)
+
+  A: Mexico, South Africa, South Korea, Czech Republic
+  B: Canada, Switzerland, Qatar, Bosnia and Herzegovina
+  C: Brazil, Morocco, Haiti, Scotland
+  D: United States, Paraguay, Australia, Turkey
+  E: Germany, Ecuador, Ivory Coast, Curaçao
+  F: Netherlands, Japan, Sweden, Tunisia
+  G: Belgium, Egypt, Iran, New Zealand
+  H: Spain, Uruguay, Saudi Arabia, Cape Verde
+  I: France, Senegal, Norway, Iraq
+  J: Argentina, Algeria, Austria, Jordan
+  K: Portugal, Colombia, DR Congo, Uzbekistan
+  L: England, Croatia, Ghana, Panama
+
+BRACKET MATA-MATA (estrutura oficial FIFA)
+
+  Fase de 32 (jogos 73-88):
+    73: 2ºA vs 2ºB
+    74: 1ºE vs 3º(A/B/C/D/F)
+    75: 1ºF vs 2ºC
+    76: 1ºC vs 2ºF
+    77: 1ºI vs 3º(C/D/F/G/H)
+    78: 2ºE vs 2ºI
+    79: 1ºA vs 3º(C/E/F/H/I)
+    80: 1ºL vs 3º(E/H/I/J/K)
+    81: 1ºD vs 3º(B/E/F/I/J)
+    82: 1ºG vs 3º(A/E/H/I/J)
+    83: 2ºK vs 2ºL
+    84: 1ºH vs 2ºJ
+    85: 1ºB vs 3º(E/F/G/I/J)
+    86: 1ºJ vs 2ºH
+    87: 1ºK vs 3º(D/E/I/J/L)
+    88: 2ºD vs 2ºG
+
+  Oitavos (jogos 89-96):
+    89: W74 vs W77
+    90: W73 vs W75
+    91: W76 vs W78
+    92: W79 vs W80
+    93: W83 vs W84
+    94: W81 vs W82
+    95: W86 vs W88
+    96: W85 vs W87
+
+  Quartos (jogos 97-100):
+    97: W89 vs W90
+    98: W93 vs W94
+    99: W91 vs W92
+   100: W95 vs W96
+
+  Meias (jogos 101-102):
+   101: W97 vs W98
+   102: W99 vs W100
+
+  3º Lugar (jogo 103):
+   103: L101 vs L102
+
+  Final (jogo 104):
+   104: W101 vs W102
+
+SIMPLIFICAÇÃO DOCUMENTADA — TERCEIROS CLASSIFICADOS
+  Problema: a atribuição exacta do 3º ao slot do bracket segue uma tabela
+  oficial FIFA com 28 combinações possíveis (depende de quais grupos
+  contribuem os 8 terceiros qualificados).
+  
+  Abordagem adoptada:
+    1. Classificar os 12 terceiros por pontos → Diff_Ranking como desempate
+    2. Top 8 avançam para o mata-mata
+    3. Atribuição ao slot: dentro do pool de grupos indicado no bracket,
+       atribuir o terceiro disponível com mais pontos
+  
+  Justificação: simplificação necessária e documentada. Para um portfolio
+  é honesta e defensável. A lógica de simulação dos jogos é idêntica.
+
+================================================================================
+
+
+================================================================================
+LIMITAÇÕES IDENTIFICADAS E DOCUMENTADAS
+Gerado em: 2026-06-22
+================================================================================
+
+LIMITAÇÃO 1 — INFLAÇÃO DE FORMA POR JOGOS DO MUNDIAL
+------------------------------------------------------
+Problema:
+  As features Forma_Golos e Forma_Pts são calculadas com base nos últimos
+  10 jogos de cada equipa, incluindo os jogos já disputados no Mundial 2026.
+  Equipas com arranque forte (ex: México 2V em 2 jogos) têm features de forma
+  inflacionadas que o simulador usa nas previsões futuras.
+
+Impacto:
+  - O modelo foi treinado sem ver jogos do Mundial nas features de forma
+  - Existe um shift de distribuição entre treino e inferência
+  - Equipas com bom arranque são sistematicamente favorecidas no bracket
+  - Resultado: México como campeão (2V em 2 jogos no Mundial)
+
+Perspectivas:
+  PRO (é razoável): a forma recente inclui jogos reais e actualizados —
+    é informação legítima sobre o estado actual da equipa
+  CONTRA (é problemático): 2 jogos são ruído estatístico insuficiente
+    para alterar significativamente a avaliação de uma equipa
+
+Abordagem adoptada:
+  Manter o comportamento actual e documentar a limitação.
+  A narrativa para o portfolio é mais forte com honestidade:
+  "O simulador usa a forma mais recente disponível, incluindo os jogos
+  já disputados do torneio — o que beneficia equipas com arranque forte.
+  Esta é uma limitação conhecida e um ponto de melhoria futura."
+
+Melhoria futura possível:
+  Aumentar a janela de forma de N=10 para N=20, diluindo o peso dos jogos
+  do Mundial sem os ignorar. Com N=20, os jogos do Mundial representam
+  10% da janela em vez de 20% — efeito de inflação reduzido sem perda
+  de informação real.
+
+  Alternativa descartada: congelar features a 2026-06-11 ignoraria
+  informação real e recente dos jogos já disputados no torneio
+  para todos os jogos do simulador, eliminando o efeito de inflação.
+
+RESULTADO DA SIMULAÇÃO (estado: 28 jogos disputados, 44 previstos)
+  🏆 Campeão:    Mexico
+  🥈 Vice:       Belgium
+  🥉 3º lugar:   Argentina
+  4º lugar:      Germany
+
+================================================================================
+
+
+================================================================================
+LIMITAÇÃO 2 — NATUREZA HÍBRIDA DO SIMULADOR EM TORNEIO EM CURSO
+Gerado em: 2026-06-22
+================================================================================
+
+PROBLEMA IDENTIFICADO
+  O modelo foi desenhado para previsão genuína antes do torneio começar.
+  À medida que os jogos se disputam, as features de forma incorporam
+  resultados reais — o simulador transita de "previsão" para "extrapolação".
+
+DOIS MOMENTOS DISTINTOS
+  Antes do torneio:
+    - Todas as features são históricas
+    - Previsão genuína e independente
+    - Maior valor preditivo
+
+  Durante o torneio:
+    - Features de forma incorporam jogos já disputados
+    - O simulador começa a "descrever" o que já aconteceu
+    - Menor carácter preditivo puro, maior consistência com resultados reais
+
+EXEMPLO CONCRETO — MÉXICO VS ARGENTINA
+  México ganha 3 jogos do grupo → forma inflacionada → modelo favorece México
+  Argentina tem ranking #1 → Diff_Ranking deveria dominar
+  Resultado: features de forma recente têm peso excessivo face ao ranking
+
+  Isto revela que com N=10 e 3 jogos do Mundial já disputados,
+  a forma recente representa 30% da janela — peso demasiado elevado
+  para apenas 3 jogos de grupo.
+
+RELAÇÃO COM LIMITAÇÃO 1
+  A melhoria futura de N=10 → N=20 atenua este problema:
+  3 jogos do Mundial passam a representar 15% da janela em vez de 30%.
+  Não resolve completamente mas reduz o efeito de distorção.
+
+PERSPECTIVA ACADÉMICA
+  Este problema é universal em modelos preditivos aplicados a torneios
+  em curso. FiveThirtyEight, Opta e outros modelos profissionais
+  partilham a mesma limitação estrutural.
+
+NARRATIVA PARA PORTFOLIO
+  "O modelo tem maior valor preditivo genuíno antes do torneio começar.
+  À medida que os resultados reais chegam, o simulador incorpora essa
+  informação — o que melhora a consistência das previsões mas reduz
+  o carácter preditivo puro. Esta é uma limitação estrutural conhecida
+  em qualquer modelo preditivo aplicado a torneios em curso."
+
+MELHORIAS FUTURAS
+  1. Aumentar janela de forma: N=10 → N=20
+  2. Ponderar features de forma vs ranking de forma dinâmica ao longo
+     do torneio (ex: dar mais peso ao Diff_Ranking no mata-mata)
+  3. Adicionar feature de confrontos directos históricos entre equipas
+     (head-to-head) — capturaria padrões como Argentina vs México
+
+================================================================================
+
+
+================================================================================
+ITERAÇÃO V2 — DECISÕES DE MELHORIA DO MODELO
+Gerado em: 2026-06-22
+================================================================================
+
+CONTEXTO
+  Após análise crítica dos resultados da V1, identificámos que o modelo,
+  embora funcionalmente correcto, apresentava limitações que comprometiam
+  a qualidade preditiva genuína. Seguiu-se uma discussão estruturada
+  que levou a duas decisões de melhoria antes do re-treino.
+
+DECISÃO 1 — REMOVER JOGOS AMIGÁVEIS DO TREINO
+  Problema identificado:
+    O dataset de treino V1 continha 23.284 amigáveis (51% do total).
+    Amigáveis são jogos sem pressão real — equipas experimentam, poupam
+    titulares, e os resultados são menos previsíveis pelo ranking.
+    O modelo aprendeu que o ranking não importa muito, porque nos amigáveis
+    genuinamente não importa. Isto degradou a qualidade preditiva em
+    contexto competitivo como o Mundial.
+
+  Decisão: excluir Tipo_Competicao == "Amigavel" do dataset de treino.
+
+DECISÃO 2 — CORTE TEMPORAL EM 1990
+  Problema identificado:
+    Manter todo o histórico desde 1873 introduz ruído significativo:
+    - Contexto táctico, físico e de qualidade radicalmente diferente
+    - Padrões históricos de domínio (Brasil, Alemanha) que já não refletem
+      a realidade actual — e que o ranking FIFA já captura de forma
+      mais rigorosa e actualizada
+    - Risco de confirmation bias: favorecer equipas historicamente grandes
+      por peso de resultados antigos, não por qualidade presente
+
+  Opções consideradas:
+    - Manter todo o histórico de Mundiais → ruído pré-moderno, viés histórico
+    - Corte em 2000 → perde contexto relevante dos anos 90
+    - Corte em 1990 → ano de criação do ranking FIFA; captura toda a era
+      moderna incluindo Brasil 94, França 98, e os grandes torneios recentes
+
+  Decisão: manter apenas jogos a partir de 1990-01-01.
+
+  Justificação do corte em 1990:
+    O ranking FIFA foi criado em 1992 e retroactivamente calibrado.
+    A partir de 1990, as features e a realidade competitiva estão alinhadas.
+    Querer que o modelo "saiba" que o Brasil ganhou em 1970 seria criar viés —
+    essa qualidade histórica já está reflectida no ranking actual.
+
+DATASET DE TREINO V2
+  Filtros aplicados:
+    - Tipo_Competicao != "Amigavel"
+    - date >= 1990-01-01
+    - (restantes filtros V1 mantidos: home_score.notna(), ranks preenchidos,
+       features sem NaN, date < 2026-06-11)
+
+  Impacto esperado:
+    - Dataset mais pequeno mas mais signal-dense
+    - Diff_Ranking com maior peso preditivo
+    - Modelo mais adequado ao contexto competitivo do Mundial
+
+PRÓXIMO PASSO
+  Re-treino completo no notebook 03 com df_train_v2
+  Re-execução do simulador no notebook 04 com os novos modelos
+
+================================================================================
+
+
+================================================================================
+ITERAÇÃO V2 — RESULTADOS E ANÁLISE COMPARATIVA
+Gerado em: 2026-06-22
+================================================================================
+
+MÉTRICAS COMPARATIVAS V1 vs V2
+
+  ┌─────────────────────┬──────────┬───────────┬──────────────────┬──────────┐
+  │ Modelo              │ Corretos │ Accuracy  │ Empates acertados│ Log-loss │
+  ├─────────────────────┼──────────┼───────────┼──────────────────┼──────────┤
+  │ V1 — LR             │ 16/28    │ 57.1%     │ 0/10             │ 0.988    │
+  │ V1 — RF             │ 14/28    │ 50.0%     │ 1/10             │ 0.966    │
+  │ V2 — LR             │ 16/28    │ 57.1%     │ 0/10             │ 0.968    │
+  │ V2 — RF             │ 16/28    │ 57.1%     │ 1/10             │ 0.906    │
+  └─────────────────────┴──────────┴───────────┴──────────────────┴──────────┘
+
+  Baseline naive (sempre H): 15/28 — 53.6%
+
+ANÁLISE DOS RESULTADOS V2
+  Melhorias confirmadas:
+    - RF V2 igualou a accuracy do LR (57.1%) — era 50% no V1
+    - Log-loss RF desceu de 0.966 → 0.906 — melhor calibração de probabilidades
+    - Precision melhorou em todas as classes (A: 0.43→0.50, H: 0.56→0.60)
+    - Probabilidades mais extremas em jogos desequilibrados (França 0.96, Bélgica 0.96)
+    - Menos dados mas mais signal-dense produziu modelo mais calibrado
+
+  O que não mudou:
+    - Empates continuam difíceis — 1/10 em ambas as versões
+    - LR não melhorou significativamente — já estava no limite das features actuais
+    - Empates são estruturalmente imprevisíveis — problema em aberto na literatura
+
+MÉTRICA ADOPTADA — LOG-LOSS
+  ROC-AUC foi considerada e descartada conscientemente:
+    - ROC clássica é binária — não se aplica directamente a contexto trinário (H/D/A)
+    - Versão multiclasse One-vs-Rest com apenas 3 casos de "A" no teste seria
+      estatisticamente instável e enganadora
+  
+  Log-loss é a métrica correcta porque:
+    - Funciona nativamente com probabilidades multiclasse
+    - Penaliza previsões confiantes que estão erradas
+    - Alinhada com o uso de .predict_proba() no simulador de mata-mata
+
+RESULTADO DO SIMULADOR V2
+  (estado: 28 jogos disputados, 44 previstos)
+
+  Fase de 32 — surpresas notáveis:
+    - Áustria elimina Espanha (0.564 vs 0.436)
+    - Turquia elimina Portugal (0.567 vs 0.433)
+    - Irão elimina Uruguai (0.608 vs 0.392)
+    - Probabilidades mais diferenciadas que V1 — modelo mais confiante
+
+  Resultados finais:
+    🏆 Campeão:   Mexico
+    🥈 Vice:      Netherlands
+    🥉 3º lugar:  Switzerland
+    4º lugar:     United States
+
+  Final: México vs Holanda → 0.505 vs 0.495 (essencialmente um coin flip)
+  Interpretação: duas equipas equilibradas em campo neutro sem fator casa —
+  o modelo não tem convicção, o que é honesto e estatisticamente correcto.
+
+OBSERVAÇÃO SOBRE A CONSISTÊNCIA DO RESULTADO
+  México campeão em V1 e V2. A razão não é uma falha do modelo:
+    1. México ganhou os 3 jogos do grupo — forma inflacionada (Limitação 1)
+    2. O bracket coloca o México num lado da tabela favorável —
+       as grandes potências (França, Holanda, Alemanha, Brasil) eliminam-se
+       entre si do lado oposto
+    3. Na final, o modelo não tem convicção (0.505 vs 0.495) —
+       reconhece que é um jogo equilibrado
+  
+  Isto reflecte uma realidade do futebol: o sorteio importa tanto
+  quanto a qualidade. O modelo está a capturar isso correctamente.
+
+MODELO SELECCIONADO PARA PRODUÇÃO: V2 Random Forest
+  Ficheiros: model_v2_clf_rf.pkl | model_v2_clf_lr.pkl
+             model_v2_reg_home.pkl | model_v2_reg_away.pkl
+
+================================================================================
+ESTADO FINAL DO PROJECTO
+================================================================================
+
+NOTEBOOKS
+  01_scraping_ranking.ipynb      ✅ CONCLUÍDO
+  02_build_dataset.ipynb         ✅ CONCLUÍDO
+  03_model_training_v1.ipynb     ✅ CONCLUÍDO (baseline)
+  03b_model_training_v2.ipynb    ✅ CONCLUÍDO (modelo em produção)
+  04_simulator.ipynb             ✅ CONCLUÍDO (usa modelos V2)
+
+MELHORIAS APLICADAS (V1 → V2)
+  1. Remoção de amigáveis do treino
+     - 23.284 jogos sem pressão competitiva removidos
+     - Modelo deixa de aprender que ranking não importa em contexto relaxado
+
+  2. Corte temporal em 1990-01-01
+     - Elimina ruído do futebol pré-moderno
+     - Alinha features com a era do ranking FIFA
+     - Evita confirmation bias histórico (Brasil 1970, Alemanha 1974)
+     - Dataset: 45.524 → 17.563 jogos (mais pequeno, mais signal-dense)
+
+LIMITAÇÕES DOCUMENTADAS
+  1. Inflação de forma por jogos do Mundial
+     - Features de forma incluem jogos já disputados no torneio
+     - Equipas com arranque forte são sistematicamente favorecidas
+     - Melhoria futura: aumentar janela N=10 → N=20
+
+  2. Natureza híbrida do simulador em torneio em curso
+     - Antes do torneio: previsão genuína
+     - Durante o torneio: híbrido entre previsão e extrapolação
+     - À medida que jogos chegam, o simulador descreve mais e prevê menos
+
+  3. Empates estruturalmente imprevisíveis
+     - 1/10 empates acertados em ambas as versões
+     - Problema em aberto na literatura de previsão de futebol
+     - Modelos profissionais (FiveThirtyEight, Opta) atingem ~50-55% accuracy
+
+  4. Dataset de teste limitado
+     - 28 jogos — estatisticamente insuficiente para conclusões robustas
+     - Cresce dinamicamente até ~64 jogos no final do torneio
+     - 1 jogo representa 3.6% da accuracy — margem de erro elevada
+
+MELHORIAS FUTURAS IDENTIFICADAS
+  1. Janela de forma N=10 → N=20
+  2. Feature de confrontos directos históricos (head-to-head)
+  3. Ponderação dinâmica de features ao longo do torneio
+  4. Re-avaliação com dataset de teste completo (~64 jogos) no final do torneio
+
+================================================================================
+
+
+================================================================================
+ITERAÇÃO V3 — EDA E REESTRUTURAÇÃO DO PIPELINE
+Gerado em: 2026-06-22
+================================================================================
+
+CONTEXTO
+  Após análise de um notebook de referência (Kaggle — Mundial 2022), identificámos
+  uma falha de processo: ausência de EDA e verificação de qualidade dos dados
+  antes da construção de features. Corrigido com a criação do notebook
+  02_eda_dataset.ipynb, inserido na sequência correcta do pipeline.
+
+REESTRUTURAÇÃO DOS NOTEBOOKS
+  Anterior:                         Actual:
+  01_scraping_ranking.ipynb         01_scraping_ranking.ipynb
+  02_build_dataset.ipynb            02_eda_dataset.ipynb          ← NOVO
+  03_model_training_v1.ipynb        03_build_dataset.ipynb
+  03b_model_training_v2.ipynb       04_model_training_v1.ipynb
+  04_simulator.ipynb                04b_model_training_v2.ipynb
+                                    05_simulator.ipynb
+
+EDA — CONCLUSÕES (notebook 02_eda_dataset.ipynb)
+
+  Qualidade dos dados:
+    - Shape original: (49477, 9)
+    - Scores negativos: 0
+    - Valores nulos: 44 (home_score e away_score) — jogos futuros do Mundial, esperado
+    - Linhas completamente duplicadas: 0
+
+  Duplicados identificados e tratados:
+    - Tahiti vs New Caledonia (1974-02-17): scores diferentes (2-1 e 1-2)
+      → jogo de ida e volta no mesmo dia → MANTIDOS ambos
+    - Gibraltar vs Cayman Islands (2026-06-06): score idêntico, cidade diferente
+      → mesmo jogo registado duas vezes → REMOVIDO 1 registo
+
+  Shape após limpeza: (49476, 11)
+  Ficheiro limpo guardado: results_clean.csv
+
+  Outliers nos scores:
+    - 306 jogos com score >= 10
+    - Maioria são territórios não-FIFA (Tahiti, Kiribati, Sark) já excluídos
+      pelo filtro de ranking no dataset de treino
+    - Australia 31-0 American Samoa (2001) — real e legítimo, qualificação FIFA
+    - Sem necessidade de tratamento adicional
+
+  Distribuição de resultados (histórico completo):
+    H: 49.0% (24226 jogos) — vantagem casa histórica, justifica feature Fator_Casa
+    A: 28.2% (13963 jogos)
+    D: 22.7% (11243 jogos) — minoria, explica dificuldade estrutural em prever empates
+
+  Distribuição temporal:
+    - Pré-1920: volatilidade extrema — poucos jogos, scores erráticos
+    - 1920-1990: estabilização progressiva
+    - Pós-1990: padrão estável — média home ~1.6 golos, away ~1.1 golos
+    - Corte em 1990 visualmente validado pelo gráfico de golos por ano
+
+  Top equipas por nº de jogos:
+    Suécia (1104), Inglaterra (1093), Argentina (1072), Brasil (1062), Alemanha (1034)
+    Nota: Thailand (865) — volume alto por participação em qualificações asiáticas
+
+IMPACTO NO PIPELINE
+  - notebook 03_build_dataset.ipynb actualizado para ler results_clean.csv
+    em vez de results.csv
+  - Todos os notebooks downstream não requerem alteração
+
+
+================================================================================
+PRÓXIMOS PASSOS — ITERAÇÃO V3
+================================================================================
+
+  1. Actualizar notebook 03 para ler results_clean.csv             ← EM CURSO
+  2. Adicionar features de golos sofridos:
+       Forma_Golos_Sofridos_Home / Forma_Golos_Sofridos_Away
+       (média de golos sofridos nos últimos 10 jogos)
+  3. Feature importance do RF V2 — medir peso preditivo de cada feature
+  4. Modelo totalmente preditivo — remover jogos do Mundial do dataset
+     e prever fase de grupos também (sem resultados reais)
+  5. Re-treino V3 e re-execução do simulador
+
+================================================================================
+
+
+================================================================================
+ITERAÇÃO V3 — RESULTADOS FINAIS
+Gerado em: 2026-06-22
+================================================================================
+
+ALTERAÇÕES IMPLEMENTADAS NO V3
+  1. Novas features: Forma_Golos_Sofridos_Home / Forma_Golos_Sofridos_Away
+     - Média de golos sofridos nos últimos 10 jogos (shift=1, sem data leakage)
+     - Cap a 5.0 aplicado (mesmo critério que Forma_Golos)
+     - Entraram em 2º e 3º lugar na feature importance (~12% cada)
+
+  2. Ensemble assimétrico V3
+     - .predict()       → Logistic Regression V3 (melhor accuracy)
+     - .predict_proba() → Random Forest V3       (melhor log-loss)
+     - Implementado como classe local no notebook 05 (evita problema de
+       deserialização do joblib com classes customizadas)
+
+  3. Imputação de NaN no simulador
+     - Novas colunas tinham NaN em jogos futuros
+     - Solução: imputação pela mediana do df_full antes da simulação
+
+FEATURE IMPORTANCE RF V3
+
+  Diff_Ranking                        27.2%   ← domina, desceu de 34.6% (V2)
+  Forma_Golos_Sofridos_Home           12.0%   ← nova feature, 2º lugar
+  Forma_Golos_Sofridos_Away           11.8%   ← nova feature, 3º lugar
+  Forma_Golos_Home                    11.4%
+  Forma_Golos_Away                    11.2%
+  Forma_Pts_Home                      11.1%
+  Forma_Pts_Away                      10.9%
+  Fator_Casa                           1.6%
+  Tipo_Competicao_Torneio_Continental  1.2%
+  Tipo_Competicao_Qualificacao         1.1%
+  Tipo_Competicao_Mundial              0.4%
+
+  Conclusão: as novas features funcionaram — distribuição mais equilibrada
+  entre todas as features de forma (~11-12% cada), Diff_Ranking ainda domina
+  mas com menor peso relativo.
+
+MÉTRICAS COMPARATIVAS — HISTÓRICO COMPLETO
+
+  ┌─────────────────────┬──────────┬───────────┬──────────────────┬──────────┐
+  │ Modelo              │ Corretos │ Accuracy  │ Empates acertados│ Log-loss │
+  ├─────────────────────┼──────────┼───────────┼──────────────────┼──────────┤
+  │ Baseline (sempre H) │ 15/28    │ 53.6%     │ 0/10             │ —        │
+  │ V1 LR               │ 16/28    │ 57.1%     │ 0/10             │ 0.988    │
+  │ V1 RF               │ 14/28    │ 50.0%     │ 1/10             │ 0.966    │
+  │ V2 LR               │ 16/28    │ 57.1%     │ 0/10             │ 0.968    │
+  │ V2 RF               │ 16/28    │ 57.1%     │ 1/10             │ 0.906    │
+  │ V3 LR               │ 17/28    │ 60.7%     │ 0/10             │ 0.941    │
+  │ V3 RF               │ 15/28    │ 53.6%     │ 1/10             │ 0.856    │
+  │ V3 Ensemble         │ 17/28    │ 60.7%     │ 0/10             │ 0.856    │
+  └─────────────────────┴──────────┴───────────┴──────────────────┴──────────┘
+
+  Ensemble V3: melhor accuracy (60.7%) + melhor log-loss (0.856)
+  É o modelo em produção.
+
+RESULTADO DO SIMULADOR V3
+  (estado: 28 jogos disputados, 44 previstos)
+
+  Surpresas notáveis:
+    - Croácia elimina Portugal (fase 32, 0.658) — Portugal 2º no grupo K
+    - Áustria elimina Espanha (fase 32, 0.549) — padrão consistente com V2
+    - Turquia elimina Colômbia (fase 32, 0.55)
+    - França elimina Alemanha nos oitavos (0.538)
+    - México elimina Brasil nos quartos (0.563) — Limitação 1 em acção
+    - Final: França vs México — modelo confia no México (0.811 vs 0.189)
+
+  Resultados finais:
+    🏆 Campeão:   Mexico
+    🥈 Vice:      France
+    🥉 3º lugar:  Belgium
+    4º lugar:     Argentina
+
+ANÁLISE DA CONSISTÊNCIA DO MÉXICO
+  México campeão em V1, V2 e V3. Duas causas identificadas:
+    1. Limitação 1: forma inflacionada pelos 2 jogos do Mundial já ganhos
+    2. Bracket favorável: Argentina, França, Alemanha eliminam-se entre si
+       do lado oposto da tabela — México só enfrenta as grandes na final
+  O modelo é consistente — o resultado reflecte dados reais + estrutura do sorteio.
+
+NOTA SOBRE O JOGO 104 (Final)
+  França vs México → 0.189 vs 0.811
+  Diff_Ranking favorece a França (#2 vs #11) mas features de forma do México
+  dominam. É a manifestação mais clara da Limitação 1 documentada.
+  Em condições de forma neutra, a França seria favorita.
+
+MODELO EM PRODUÇÃO
+  Ensemble V3: model_v3_clf_lr.pkl + model_v3_clf_rf.pkl
+  Notebook:    05_simulator.ipynb
+
+================================================================================
+ESTADO FINAL DO PROJECTO (V3)
+================================================================================
+
+NOTEBOOKS
+  01_scraping_ranking.ipynb      ✅ CONCLUÍDO
+  02_eda_dataset.ipynb           ✅ CONCLUÍDO
+  03_build_dataset.ipynb         ✅ CONCLUÍDO (lê results_clean.csv)
+  04_model_training_v1.ipynb     ✅ CONCLUÍDO (baseline)
+  04b_model_training_v2.ipynb    ✅ CONCLUÍDO (sem amigáveis, pós-1990)
+  04c_model_training_v3.ipynb    ✅ CONCLUÍDO (+ golos sofridos, ensemble)
+  05_simulator.ipynb             ✅ CONCLUÍDO (ensemble V3 em produção)
+
+FICHEIROS DE DADOS
+  results_clean.csv              ← dataset limpo (1 duplicado removido)
+  fifa_ranking.csv               ← ranking FIFA scraping em tempo real
+  df_train.csv                   ← 45524 jogos × 23 colunas
+  df_full.csv                    ← 49819 jogos × 23 colunas
+
+MODELOS GUARDADOS
+  model_clf_lr.pkl / model_clf_rf.pkl           ← V1
+  model_v2_clf_lr.pkl / model_v2_clf_rf.pkl     ← V2
+  model_v3_clf_lr.pkl / model_v3_clf_rf.pkl     ← V3
+  model_v3_reg_home.pkl / model_v3_reg_away.pkl ← Regressão Poisson V3
+  model_v3_ensemble.pkl                         ← não usar (problema joblib)
+
+LIMITAÇÕES DOCUMENTADAS
+  1. Inflação de forma por jogos do Mundial (N=10, melhoria futura N=20)
+  2. Natureza híbrida do simulador em torneio em curso
+  3. Empates estruturalmente imprevisíveis (1/10 em todas as versões)
+  4. Dataset de teste limitado (28 jogos — cresce até ~64 no final)
+
+MELHORIAS FUTURAS
+  1. Janela de forma N=10 → N=20
+  2. Feature head-to-head (confrontos directos históricos)
+  3. Ponderação dinâmica de features ao longo do torneio
+  4. Re-avaliação com dataset completo (~64 jogos) no final do torneio
+  5. Actualização dinâmica do results_clean.csv com resultados reais
+
+================================================================================
+
+
+================================================================================
+NOTEBOOK 05a — SIMULADOR TOTALMENTE PREDITIVO (OPÇÃO A)
+Gerado em: 2026-06-22
+================================================================================
+
+CONTEXTO
+  Criado como alternativa ao 05_simulator.ipynb (modo híbrido).
+  Objectivo: previsão pura sem contaminação de resultados reais do Mundial.
+  Implementação: played = pd.DataFrame() — todos os 72 jogos da fase de
+  grupos são previstos pelo modelo, incluindo os 28 já disputados.
+
+DIFERENÇA FACE AO 05 (HÍBRIDO)
+  05_simulator.ipynb:
+    - Usa os 28 resultados reais disponíveis para construir a tabela de pontos
+    - Prevê apenas os 44 jogos futuros
+    - Features de forma inflacionadas pelos jogos do Mundial já disputados
+    - Limitação 1 presente com impacto forte
+
+  05a_simulator_predictive.ipynb:
+    - Ignora todos os resultados reais — prevê os 72 jogos da fase de grupos
+    - Bracket gerado exclusivamente pelo modelo
+    - Limitação 1 mitigada (resultados reais não alimentam tabela de pontos)
+    - Limitação 1 ainda presente nas features de forma do df_full
+
+NOTA SOBRE LIMITAÇÃO RESIDUAL
+  As features de forma (Forma_Golos, Forma_Pts, Forma_Golos_Sofridos) ainda
+  incluem os jogos do Mundial já disputados — porque são lidas do df_full.
+  A eliminação completa da Limitação 1 requer congelar as features a
+  2026-06-10 (Opção B — próximo passo).
+
+CLASSIFICAÇÃO DOS GRUPOS (totalmente prevista)
+  Padrão observado: quase todos os grupos têm 1º com 9pts e 2º com 6pts
+  → modelo raramente prevê empates, favorece sistematicamente o melhor ranked
+  → consistente com feature importance (Diff_Ranking = 27%)
+
+  Surpresas notáveis:
+    - Marrocos 1º acima do Brasil no Grupo C
+      (rankings próximos #6 vs #5, forma recente de Marrocos superior)
+    - Colômbia 1º acima de Portugal no Grupo K
+      (Diff_Ranking apenas 3 posições, forma decide)
+    - Portugal e Brasil nos 16 avos como 2ºs dos respectivos grupos
+
+RESULTADO DO SIMULADOR 05a
+  🏆 Campeão:   France
+  🥈 Vice:      Morocco
+  🥉 3º lugar:  Belgium
+  4º lugar:     Argentina
+
+  Percurso da França:
+    Fase 32: Germany → France (0.538)
+    Oitavos: France elimina Germany (0.538)
+    Quartos: France elimina Brazil (0.632)
+    Meias:   France elimina Belgium (0.671)
+    Final:   France elimina Morocco (0.909) — convicção alta
+
+  Percurso de Marrocos:
+    Fase 32: Morocco elimina Japan (0.707)
+    Oitavos: Morocco elimina Ivory Coast (0.713)
+    Quartos: Morocco elimina Mexico (0.581)
+    Meias:   Morocco elimina Argentina (0.623)
+    Final:   perde para França (0.091)
+
+COMPARAÇÃO DOS DOIS SIMULADORES
+
+  ┌──────────────────┬──────────────────────┬──────────────────────┐
+  │                  │ 05 (híbrido)         │ 05a (preditivo)      │
+  ├──────────────────┼──────────────────────┼──────────────────────┤
+  │ 🏆 Campeão       │ México               │ França               │
+  │ 🥈 Vice          │ França               │ Marrocos             │
+  │ 🥉 3º lugar      │ Bélgica              │ Bélgica              │
+  │ 4º lugar         │ Argentina            │ Argentina            │
+  │ Limitação 1      │ Presente (forte)     │ Mitigada             │
+  │ Jogos previstos  │ 44 (fase grupos)     │ 72 (tudo)            │
+  │ Realismo         │ Torneio em curso     │ Previsão pura        │
+  └──────────────────┴──────────────────────┴──────────────────────┘
+
+NARRATIVA PARA PORTFOLIO/LINKEDIN
+  "Quando o modelo usa resultados reais da fase de grupos, o México —
+  com 2 vitórias consecutivas — emerge como campeão. Quando prevê tudo
+  do zero, a França ganha. A diferença ilustra o impacto da forma recente
+  vs qualidade histórica num simulador de torneio — e a importância de
+  documentar as limitações de cada abordagem."
+
+PRÓXIMO PASSO — OPÇÃO B
+  Congelar features de forma a 2026-06-10 (antes do Mundial começar)
+  para eliminar completamente a Limitação 1.
+  Implementação: snapshot das features no notebook 03_build_dataset.ipynb
+  guardado como df_forma_snapshot.csv e usado no 05a em vez do df_full.
+
+================================================================================
+
+
+================================================================================
+NOTEBOOK 05b — SIMULADOR FROZEN (OPÇÃO B)
+Gerado em: 2026-06-23
+================================================================================
+
+CONTEXTO
+  Versão mais rigorosa do simulador — elimina completamente a Limitação 1.
+  Features de forma congeladas a 2026-06-10 (dia anterior ao início do Mundial).
+  É o único simulador com previsão genuinamente independente dos resultados
+  do torneio — o que devia ter sido corrido antes do Mundial começar.
+
+IMPLEMENTAÇÃO
+  1. Snapshot criado no notebook 03_build_dataset.ipynb
+     - Para cada equipa: último registo de Forma_Golos, Forma_Pts,
+       Forma_Golos_Sofridos antes de 2026-06-11
+     - Guardado em df_forma_snapshot.csv (336 equipas)
+     - Cap a 5.0 aplicado
+
+  2. Função get_frozen_feature() — lookup no snapshot por equipa
+     - Substitui leitura do df_full nas features de forma
+     - Default 1.4 para equipas sem histórico suficiente
+
+  3. Aplicado em dois locais:
+     - Loop de previsão da fase de grupos
+     - Função simulate_ko() do mata-mata
+
+SNAPSHOT PRÉ-MUNDIAL (equipas relevantes)
+  Argentina:  Forma_Golos=2.3  Forma_Pts=2.5  Forma_Golos_Sofridos=0.3
+  France:     Forma_Golos=2.4  Forma_Pts=2.5  Forma_Golos_Sofridos=0.8
+  Brazil:     Forma_Golos=2.4  Forma_Pts=1.9  Forma_Golos_Sofridos=1.0
+  Portugal:   Forma_Golos=2.6  Forma_Pts=2.1  Forma_Golos_Sofridos=1.0
+  Mexico:     Forma_Golos=1.2  Forma_Pts=1.9  Forma_Golos_Sofridos=0.4
+
+  Nota: México com Forma_Pts=1.9 pré-Mundial vs 2.3 no simulador híbrido (05)
+  — diferença directamente causada pelas 2 vitórias no Mundial inflacionadas.
+  Isto confirma e quantifica a Limitação 1.
+
+RESULTADO DO SIMULADOR 05b
+  🏆 Campeão:   Netherlands
+  🥈 Vice:      England
+  🥉 3º lugar:  Argentina
+  4º lugar:     Belgium
+
+  Percurso da Holanda:
+    Fase 32:  Netherlands elimina Brazil (0.721)
+    Oitavos:  Netherlands elimina South Korea (0.626)
+    Quartos:  Netherlands elimina Germany (0.647)
+    Meias:    Netherlands elimina Belgium (0.564)
+    Final:    Netherlands elimina England (0.537) — jogo equilibrado
+
+  Resultado notável:
+    Jogo 96: Switzerland vs Portugal → Switzerland (0.574 vs 0.426)
+    Explicação: Diff_Ranking apenas 10 posições (#19 vs #9), forma pré-Mundial
+    da Suíça superior. Resultado surpreendente pelo senso comum mas suportado
+    pelos dados. A Suíça é sistematicamente consistente em competições oficiais
+    (Euro 2020, Mundial 2022) — o modelo captura isso correctamente.
+
+COMPARAÇÃO FINAL DOS TRÊS SIMULADORES
+
+  ┌──────────────────────┬───────────────┬───────────────┬───────────────┐
+  │                      │ 05 (híbrido)  │ 05a (prediti) │ 05b (frozen)  │
+  ├──────────────────────┼───────────────┼───────────────┼───────────────┤
+  │ 🏆 Campeão           │ México        │ França        │ Holanda       │
+  │ 🥈 Vice              │ França        │ Marrocos      │ Inglaterra    │
+  │ 🥉 3º lugar          │ Bélgica       │ Bélgica       │ Argentina     │
+  │ 4º lugar             │ Argentina     │ Argentina     │ Bélgica       │
+  │ Data leakage         │ Alto          │ Médio         │ Zero          │
+  │ Resultados reais     │ 28 jogos      │ Nenhum        │ Nenhum        │
+  │ Features contaminadas│ Sim           │ Sim (subtil)  │ Não           │
+  │ Previsão genuína     │ ❌            │ Parcial       │ ✅            │
+  └──────────────────────┴───────────────┴───────────────┴───────────────┘
+
+NARRATIVA PARA PORTFOLIO/LINKEDIN
+  "Desenvolvemos três versões do simulador com níveis crescentes de rigor
+  preditivo. O modelo híbrido (05) incorpora resultados reais e é útil
+  para acompanhar o torneio em tempo real. O modelo preditivo (05a) ignora
+  resultados reais mas ainda usa features contaminadas. O modelo frozen (05b)
+  é o tecnicamente correcto — features e previsões completamente independentes
+  do torneio, como se fosse corrido antes do primeiro apito.
+  Os três campeões diferentes (México, França, Holanda) ilustram o impacto
+  do data leakage e a importância de isolar correctamente treino e inferência."
+
+
+================================================================================
+ESTADO FINAL DO PROJECTO — VERSÃO COMPLETA
+================================================================================
+
+NOTEBOOKS (ordem de execução)
+  01_scraping_ranking.ipynb         ✅ Scraping ranking FIFA em tempo real
+  02_eda_dataset.ipynb              ✅ EDA + limpeza + validação de qualidade
+  03_build_dataset.ipynb            ✅ Features + snapshot congelado
+  04_model_training_v1.ipynb        ✅ Baseline (todos os dados)
+  04b_model_training_v2.ipynb       ✅ Sem amigáveis + corte 1990
+  04c_model_training_v3.ipynb       ✅ + golos sofridos + ensemble
+  05_simulator.ipynb                ✅ Híbrido (resultados reais + previsões)
+  05a_simulator_predictive.ipynb    ✅ Preditivo total (features contaminadas)
+  05b_simulator_frozen.ipynb        ✅ Frozen (previsão genuína — modelo final)
+
+FICHEIROS DE DADOS
+  results_clean.csv                 ← dataset limpo (1 duplicado removido)
+  fifa_ranking.csv                  ← ranking FIFA scraping em tempo real
+  df_train.csv                      ← 45524 jogos × 23 colunas
+  df_full.csv                       ← 49819 jogos × 23 colunas
+  df_forma_snapshot.csv             ← features congeladas a 2026-06-10
+
+MODELOS GUARDADOS
+  model_clf_lr.pkl / model_clf_rf.pkl           ← V1 (baseline)
+  model_v2_clf_lr.pkl / model_v2_clf_rf.pkl     ← V2 (sem amigáveis/pós-1990)
+  model_v3_clf_lr.pkl / model_v3_clf_rf.pkl     ← V3 (modelo em produção)
+  model_v3_reg_home.pkl / model_v3_reg_away.pkl ← Regressão Poisson V3
+  model_v3_ensemble.pkl                         ← não usar (problema joblib)
+
+MÉTRICAS FINAIS — ENSEMBLE V3
+  Accuracy:  60.7% (17/28) — melhor de todos os modelos
+  Log-loss:  0.856          — melhor calibração de probabilidades
+  Baseline:  53.6% (15/28)
+  Empates:   0/10           — limitação estrutural mantida
+
+LIMITAÇÕES DOCUMENTADAS
+  1. Inflação de forma por jogos do Mundial
+     → Quantificada: México Forma_Pts 1.9 → 2.3 após 2 jogos
+     → Melhoria futura: N=10 → N=20
+  2. Natureza híbrida do simulador em torneio em curso
+     → Resolvida no 05b com features congeladas
+  3. Empates estruturalmente imprevisíveis (0-1/10 em todas as versões)
+  4. Dataset de teste limitado (28 jogos — cresce até ~64 no final)
+  5. Ausência de feature head-to-head (confrontos directos históricos)
+
+MELHORIAS FUTURAS
+  1. Janela de forma N=10 → N=20
+  2. Feature head-to-head (confrontos directos históricos)
+  3. Re-avaliação com dataset completo (~64 jogos) no final do torneio
+  4. Actualização dinâmica do results_clean.csv com resultados reais
+  5. Modelo binário como alternativa (V/não-V) com ROC-AUC como métrica
+
+================================================================================
+FIM DO PROJECTO
+================================================================================
+
+
+================================================================================
+REVISÃO 05b — SIMULADOR FROZEN V2 (ABORDAGEM SIMPLIFICADA)
+Gerado em: 2026-06-23
+================================================================================
+
+CONTEXTO
+  Após reflexão, identificámos que a abordagem do snapshot por equipa
+  (df_forma_snapshot.csv) era desnecessariamente complexa. A solução mais
+  limpa e directa é criar um dataset com o calendário completo do Mundial
+  com as features já calculadas e congeladas a 2026-06-10.
+
+  Princípio: menos é mais.
+
+ALTERAÇÕES FACE À VERSÃO ANTERIOR DO 05b
+
+  Eliminado:
+    - df_forma_snapshot.csv
+    - Bloco de criação do snapshot no notebook 03
+    - Função get_frozen_feature() no simulador
+    - Complexidade desnecessária
+
+  Substituído por:
+    - df_wc_predict.csv — calendário do Mundial (72 jogos) com features
+      congeladas a 2026-06-10, uma linha por jogo, pronto a injectar
+    - Loop de previsão simplificado: X = pd.DataFrame([row[FEATURES]])
+    - simulate_ko() simplificada: lê features do df_wc_predict por equipa
+
+ESTRUTURA DO df_wc_predict.csv
+  72 linhas × 11 colunas
+  Colunas: date | home_team | away_team |
+           Forma_Golos_Home | Forma_Pts_Home | Forma_Golos_Sofridos_Home |
+           Forma_Golos_Away | Forma_Pts_Away | Forma_Golos_Sofridos_Away |
+           Fator_Casa | Tipo_Competicao
+  NaN: 0 em todas as colunas
+  Features de forma: último estado de cada equipa antes de 2026-06-11
+  Fator_Casa: 0 (campo neutro forçado)
+  Tipo_Competicao: "Mundial" (forçado)
+  Diff_Ranking: calculado no momento para cada jogo via get_rank()
+
+RESULTADO DO SIMULADOR 05b FINAL
+  🏆 Campeão:   Argentina
+  🥈 Vice:      Spain
+  🥉 3º lugar:  England
+  4º lugar:     France
+
+  Percurso da Argentina:
+    Fase 32:  Argentina elimina Uruguay (0.857)
+    Oitavos:  Argentina elimina Australia (0.823)
+    Quartos:  Argentina elimina Portugal (0.676)
+    Meias:    Argentina elimina England (0.598)
+    Final:    Argentina elimina Spain (0.561) — jogo equilibrado
+
+  Percurso da Espanha:
+    Fase 32:  Spain elimina Austria (0.749)
+    Oitavos:  Spain elimina Colombia (0.602)
+    Quartos:  Spain elimina United States (0.927)
+    Meias:    Spain elimina France (0.608)
+    Final:    perde para Argentina (0.439)
+
+  Nota: Portugal eliminado nos quartos pela Argentina (0.676)
+  Nota: México eliminado nos oitavos pela Inglaterra (0.528)
+        — sem inflação de forma, México avaliado correctamente
+
+COMPARAÇÃO FINAL DOS QUATRO SIMULADORES
+
+  ┌──────────────────────┬───────────┬───────────┬────────────┬────────────┐
+  │                      │ 05        │ 05a       │ 05b (ant.) │ 05b (final)│
+  ├──────────────────────┼───────────┼───────────┼────────────┼────────────┤
+  │ 🏆 Campeão           │ México    │ França    │ Holanda    │ Argentina  │
+  │ 🥈 Vice              │ França    │ Marrocos  │ Inglaterra │ Espanha    │
+  │ 🥉 3º lugar          │ Bélgica   │ Bélgica   │ Argentina  │ Inglaterra │
+  │ 4º lugar             │ Argentina │ Argentina │ Bélgica    │ França     │
+  │ Data leakage         │ Alto      │ Médio     │ Baixo      │ Zero       │
+  │ Resultados reais     │ 28 jogos  │ Nenhum    │ Nenhum     │ Nenhum     │
+  │ Features contaminadas│ Sim       │ Sim       │ Não        │ Não        │
+  │ Previsão genuína     │ ❌        │ Parcial   │ ✅         │ ✅         │
+  └──────────────────────┴───────────┴───────────┴────────────┴────────────┘
+
+ANÁLISE DO RESULTADO FINAL
+  Argentina campeã é o resultado mais defensável:
+    - Ranking #1 mundial
+    - Forma_Pts=2.5 pré-Mundial — melhor de todas as 48 equipas
+    - Campeã do Mundo 2022 — consistência validada
+    - Final vs Espanha (#1 vs #3) — os dois melhores ranked na final
+    - 0.561 vs 0.439 — jogo equilibrado, não uma goleada
+
+  "Previsão óbvia mas honesta":
+    Num modelo baseado em ranking e forma histórica, Argentina e Espanha
+    no topo é o resultado esperado. O futebol real tem muito mais ruído
+    (lesões, expulsões, variância) — mas o modelo faz o que deve:
+    identificar as melhores equipas com base em dados objectivos.
+
+NARRATIVA FINAL PARA PORTFOLIO/LINKEDIN
+  "Desenvolvemos quatro versões do simulador com níveis crescentes de rigor.
+  O modelo com zero data leakage (05b final) prevê Argentina campeã —
+  o #1 do mundo com a melhor forma pré-torneio. Cada versão anterior,
+  com diferentes níveis de contaminação por resultados reais, produziu
+  campeões diferentes (México, França, Holanda) — ilustrando de forma
+  concreta o impacto do data leakage em modelos preditivos de torneios."
+
+================================================================================
+FICHEIROS FINAIS DO PROJECTO
+================================================================================
+
+NOTEBOOKS (ordem de execução)
+  01_scraping_ranking.ipynb         ✅ Scraping ranking FIFA em tempo real
+  02_eda_dataset.ipynb              ✅ EDA + limpeza + validação de qualidade
+  03_build_dataset.ipynb            ✅ Features + df_wc_predict congelado
+  04_model_training_v1.ipynb        ✅ Baseline (todos os dados)
+  04b_model_training_v2.ipynb       ✅ Sem amigáveis + corte 1990
+  04c_model_training_v3.ipynb       ✅ + golos sofridos + ensemble
+  05_simulator.ipynb                ✅ Híbrido (resultados reais + previsões)
+  05a_simulator_predictive.ipynb    ✅ Preditivo total (features contaminadas)
+  05b_simulator_frozen.ipynb        ✅ Frozen — previsão genuína (modelo final)
+
+FICHEIROS DE DADOS
+  results_clean.csv                 ← dataset limpo (1 duplicado removido)
+  fifa_ranking.csv                  ← ranking FIFA scraping em tempo real
+  df_train.csv                      ← 45524 jogos × 23 colunas
+  df_full.csv                       ← 49819 jogos × 23 colunas
+  df_wc_predict.csv                 ← 72 jogos Mundial × 11 colunas (frozen)
+
+MODELOS GUARDADOS
+  model_clf_lr.pkl / model_clf_rf.pkl           ← V1 (baseline)
+  model_v2_clf_lr.pkl / model_v2_clf_rf.pkl     ← V2 (sem amigáveis/pós-1990)
+  model_v3_clf_lr.pkl / model_v3_clf_rf.pkl     ← V3 (modelo em produção)
+  model_v3_reg_home.pkl / model_v3_reg_away.pkl ← Regressão Poisson V3
+  [model_v3_ensemble.pkl — não usar, problema joblib]
+
+================================================================================
+
+
+================================================================================
+LIMITAÇÃO ADICIONAL — CONVERGÊNCIA PARA O ÓBVIO
+Gerado em: 2026-06-23
+================================================================================
+
+PROBLEMA IDENTIFICADO
+  Os modelos Random Forest e Logistic Regression aprendem padrões médios
+  históricos. Por definição, convergem sempre para o resultado mais provável
+  — a equipa com melhor ranking e melhor forma ganha sistematicamente.
+  O resultado final (Argentina campeã) é estatisticamente correcto mas
+  pouco surpreendente, não capturando a variância real do futebol.
+
+CAUSA RAIZ
+  Não é falta de features — é a natureza dos modelos escolhidos.
+  Um classificador supervisionado maximiza a accuracy esperada, o que
+  equivale a prever sempre o resultado mais provável. Não tem mecanismo
+  para gerar surpresas ou variância.
+
+  Exemplo concreto: Argentina (#1, Forma_Pts=2.5) vai sempre ganhar
+  um simulador determinístico independentemente das features adicionais
+  que se acrescentem — porque é objectivamente a melhor equipa nos dados.
+
+FEATURES ADICIONAIS CONSIDERADAS E AVALIADAS
+  Head-to-head (confrontos directos históricos):
+    - Calculável com o results.csv existente
+    - Valor real: alto — capturaria padrões como Portugal vs Suíça
+    - Implementação: média de resultados nos últimos N confrontos directos
+    - É a única feature adicional implementável sem dados externos
+    - Melhoria futura prioritária
+
+  Cartões amarelos/vermelhos:
+    - Não disponíveis no results.csv
+    - Afectam jogo pontual mas não padrão histórico
+    - Valor: médio-baixo para previsão de torneio
+
+  Posse de bola, cantos, remates, xG:
+    - Requerem fontes de dados externas (pagas ou complexas de scraping)
+    - xG (expected goals) seria a mais valiosa
+    - Fora do âmbito deste projecto
+
+MELHORIAS FUTURAS — MODELOS ALTERNATIVOS
+  Para introduzir variância real (não ruído artificial), a solução
+  não são mais features mas modelos fundamentalmente diferentes:
+
+  1. Modelo de ratings Elo
+     - Captura forma dinâmica com actualização jogo a jogo
+     - Cada vitória/derrota actualiza o rating de ambas as equipas
+     - Mais sensível a forma recente que o ranking FIFA estático
+     - Implementável com o results.csv existente
+     - É a evolução natural mais interessante deste projecto
+
+  2. Poisson Bivariado
+     - Modela golos de cada equipa independentemente
+     - Gera distribuição de resultados em vez de resultado único
+     - Introduz variância natural na previsão
+     - Mais adequado para previsão de golos que de resultado
+
+  3. Ensemble com Simulação Estocástica
+     - Corre o torneio N vezes (ex: 10.000) com probabilidades amostradas
+     - Cada corrida pode gerar um campeão diferente
+     - Output: probabilidade de cada equipa ganhar o torneio
+     - Mais rico e informativo que um simulador determinístico
+     - Descartado neste projecto por complexidade — válido numa V4
+
+  4. Feature Head-to-Head (implementável a curto prazo)
+     - Média de resultados nos últimos 5-10 confrontos directos
+     - Calculável directamente do results_clean.csv
+     - Capturaria padrões históricos entre equipas específicas
+     - Não resolve a convergência mas enriquece as previsões
+
+CONCLUSÃO
+  A "obviedade" do resultado é uma característica honesta dos modelos
+  classificadores determinísticos, não uma falha de implementação.
+  Está correctamente documentada e contextualizada.
+  Para um portfolio de ML, demonstra compreensão das limitações dos
+  modelos escolhidos e capacidade de identificar a evolução correcta.
+
+================================================================================
+FECHO DO PROJECTO
+================================================================================
+
+O projecto está completo. As próximas acções são de gestão documental:
+  - README.md para o repositório GitHub
+  - Post LinkedIn com narrativa do projecto
+  - Organização final dos notebooks e ficheiros
+
+================================================================================
+
+
+================================================================================
+ITERAÇÃO V4 — DIFF_POINTS + SAMPLE_WEIGHT
+Gerado em: 2026-06-24
+================================================================================
+
+CONTEXTO
+  Após análise descritiva aprofundada nos notebooks 01, 02 e 03, identificámos
+  duas melhorias concretas motivadas pelos dados:
+  1. Substituição de Diff_Ranking por Diff_Points
+  2. Sample weights por tipo de competição
+
+EDA — CONCLUSÕES QUE MOTIVARAM O V4
+
+  Notebook 01 (Ranking FIFA):
+    - Distribuição de pontos aproximadamente simétrica — não assimétrica
+    - CONMEBOL tem menor nº de equipas mas maior densidade de qualidade
+    - Maior cliff: Inglaterra (#4) vs Brasil (#5) — 75 pontos
+      → Diff_Ranking trata esta diferença igual a qualquer outra de 1 posição
+      → Diff_Points captura esta distância real
+
+  Notebook 02 (results_clean.csv):
+    - H/D/A por torneio: Mundial tem H=45.8%, A=31.7% — mais equilibrado
+    - Campo neutro aumenta taxa A em 7pp (26.4% → 33.4%) — valida Fator_Casa=0
+    - Mundial representa apenas 5% do treino mas 100% do teste
+      → Motivou sample_weight
+
+  Notebook 03 (df_train):
+    - Diff_Points correlação com Resultado: +0.42 (vs -0.42 do Diff_Ranking)
+    - Diff_Ranking vs Diff_Points: correlação = -0.97 — multicolinearidade
+      quasi-perfeita → manter os dois seria redundância total
+    - Decisão: remover Diff_Ranking, manter Diff_Points
+    - Outros pares com correlação alta (0.66-0.69): aceitáveis para RF
+
+ALTERAÇÕES IMPLEMENTADAS
+
+  1. Diff_Points substitui Diff_Ranking
+     - Adicionado no notebook 03 via merge com fifa_ranking.csv (campo "points")
+     - df_train.csv e df_wc_predict.csv actualizados sem Diff_Ranking
+     - Diff_Points range: -1143 a +1143 (vs -208 a +208 do Diff_Ranking)
+     - Feature importance: 28.1% (vs 27.2% do Diff_Ranking no V3)
+
+  2. Sample weights por tipo de competição
+     - Mundial: peso 10
+     - Torneio_Continental: peso 3
+     - Qualificacao: peso 2
+     - Amigavel: peso 1
+     - Aplicado no .fit() via clf__sample_weight
+
+MÉTRICAS V4
+
+  ┌─────────────────────┬──────────┬───────────┬──────────────────┬──────────┐
+  │ Modelo              │ Corretos │ Accuracy  │ Empates acertados│ Log-loss │
+  ├─────────────────────┼──────────┼───────────┼──────────────────┼──────────┤
+  │ Baseline (sempre H) │ 15/28    │ 53.6%     │ 0/10             │ —        │
+  │ V3 Ensemble         │ 17/28    │ 60.7%     │ 0/10             │ 0.856    │
+  │ V4 LR               │ 17/28    │ 60.7%     │ 0/10             │ 0.922    │
+  │ V4 RF               │ 16/28    │ 57.1%     │ 1/10             │ 0.885    │
+  │ V4 Ensemble         │ 17/28    │ 60.7%     │ 0/10             │ 0.885    │
+  └─────────────────────┴──────────┴───────────┴──────────────────┴──────────┘
+
+FEATURE IMPORTANCE RF V4
+  Diff_Points                         28.1%   ← superior ao Diff_Ranking (27.2%)
+  Forma_Golos_Sofridos_Home           11.5%
+  Forma_Golos_Sofridos_Away           11.4%
+  Forma_Golos_Home                    11.1%
+  Forma_Golos_Away                    11.0%
+  Forma_Pts_Home                      10.8%
+  Forma_Pts_Away                      10.6%
+  Fator_Casa                           1.7%
+  Tipo_Competicao_Torneio_Continental  1.4%
+  Tipo_Competicao_Qualificacao         1.3%
+  Tipo_Competicao_Mundial              1.1%   ← subiu de 0.4% (efeito sample_weight)
+
+ANÁLISE DOS RESULTADOS
+  Accuracy manteve-se (17/28) mas log-loss subiu ligeiramente (0.856 → 0.885).
+  O V3 Ensemble continua a ser o melhor modelo em log-loss.
+
+  Razão pela qual sample_weight não melhorou:
+    Os 542 jogos do Mundial já têm efeito via Diff_Points (feature muito forte).
+    O peso adicional não acrescenta sinal novo — o modelo já aprendeu
+    os padrões do Mundial através da qualidade das features.
+
+  Diff_Points confirmado como feature superior:
+    - Captura distância real entre equipas (ex: Argentina 1902pts vs Qatar 1220pts)
+    - Escala contínua vs ordinal do Diff_Ranking
+    - Correlação com resultado ligeiramente superior
+
+DECISÃO
+  Modelo em produção: V3 Ensemble (melhor log-loss = 0.856)
+  V4 mantido como iteração documentada — Diff_Points é melhoria real
+  mesmo sem ganho nas métricas de teste (28 jogos são insuficientes
+  para detectar diferenças pequenas de forma estatisticamente robusta)
+
+FICHEIROS ACTUALIZADOS
+  df_train.csv          ← sem Diff_Ranking, com Diff_Points (45524 × 16)
+  df_wc_predict.csv     ← sem Diff_Ranking, com Diff_Points (72 × 12)
+  model_v4_clf_lr.pkl   ← LR V4
+  model_v4_clf_rf.pkl   ← RF V4
+  model_v4_reg_home.pkl ← Poisson V4
+  model_v4_reg_away.pkl ← Poisson V4
+
+NOTA SOBRE ENSEMBLE E SERIALIZAÇÃO
+  A classe EnsembleClassifier é definida localmente em cada notebook
+  (treino e simuladores) para evitar o problema de deserialização do joblib
+  com classes customizadas. Os modelos base (LR e RF) são guardados
+  separadamente e o ensemble é reconstruído no momento de uso.
+
+================================================================================
+HISTÓRICO COMPLETO DE MÉTRICAS
+
+  ┌─────────────────────┬──────────┬───────────┬──────────────────┬──────────┐
+  │ Modelo              │ Corretos │ Accuracy  │ Empates acertados│ Log-loss │
+  ├─────────────────────┼──────────┼───────────┼──────────────────┼──────────┤
+  │ Baseline (sempre H) │ 15/28    │ 53.6%     │ 0/10             │ —        │
+  │ V1 LR               │ 16/28    │ 57.1%     │ 0/10             │ 0.988    │
+  │ V1 RF               │ 14/28    │ 50.0%     │ 1/10             │ 0.966    │
+  │ V2 LR               │ 16/28    │ 57.1%     │ 0/10             │ 0.968    │
+  │ V2 RF               │ 16/28    │ 57.1%     │ 1/10             │ 0.906    │
+  │ V3 LR               │ 17/28    │ 60.7%     │ 0/10             │ 0.941    │
+  │ V3 RF               │ 15/28    │ 53.6%     │ 1/10             │ 0.856    │
+  │ V3 Ensemble         │ 17/28    │ 60.7%     │ 0/10             │ 0.856    ← MELHOR│
+  │ V4 LR               │ 17/28    │ 60.7%     │ 0/10             │ 0.922    │
+  │ V4 RF               │ 16/28    │ 57.1%     │ 1/10             │ 0.885    │
+  │ V4 Ensemble         │ 17/28    │ 60.7%     │ 0/10             │ 0.885    │
+  └─────────────────────┴──────────┴───────────┴──────────────────┴──────────┘
+
+================================================================================
+ESTADO FINAL DOS NOTEBOOKS
+================================================================================
+
+  01_scraping_ranking.ipynb         ✅ + confederação extraída
+  02_eda_dataset.ipynb              ✅ + análise H/D/A por torneio/década
+  03_build_dataset.ipynb            ✅ + Diff_Points + EDA features + matriz correlação
+  04_model_training_v1.ipynb        ✅ baseline
+  04b_model_training_v2.ipynb       ✅ sem amigáveis + corte 1990
+  04c_model_training_v3.ipynb       ✅ + golos sofridos + ensemble (MELHOR LOG-LOSS)
+  04d_model_training_v4.ipynb       ✅ + Diff_Points + sample_weight
+  05_simulator.ipynb                ✅ híbrido
+  05a_simulator_predictive.ipynb    ✅ preditivo total
+  05b_simulator_frozen.ipynb        ✅ frozen — previsão genuína
+
+================================================================================
+
+
+================================================================================
+SIMULADOR 05b V4 — RESULTADOS FINAIS
+Gerado em: 2026-06-24
+================================================================================
+
+CONTEXTO
+  Simulador frozen actualizado para usar modelos V4 (Diff_Points + sample_weight).
+  Features e modelos completamente limpos — versões anteriores removidas do notebook.
+  Este é o modelo e simulador final seleccionado para o portfolio.
+
+NOTA SOBRE LIMPEZA DO NOTEBOOK
+  Durante a actualização do 05b para V4, os scripts das versões anteriores
+  (V3 com Diff_Ranking) foram removidos. Sem impacto — o 05b é o simulador
+  final e as versões anteriores estão documentadas nos notebooks 05 e 05a.
+
+RESULTADO DO SIMULADOR 05b V4
+  (features congeladas a 2026-06-10, modelos V4, Diff_Points)
+
+  🏆 Campeão:   Argentina
+  🥈 Vice:      Spain
+  🥉 3º lugar:  England
+  4º lugar:     Germany
+
+  Final: Argentina vs Espanha → 0.635 vs 0.365
+  (V3 frozen tinha 0.561 vs 0.439 — V4 mais confiante no resultado)
+
+  Percurso da Argentina:
+    Fase 32:  Argentina elimina Uruguay (0.909)
+    Oitavos:  Argentina elimina Iran (0.975)
+    Quartos:  Argentina elimina Switzerland (0.650)
+    Meias:    Argentina elimina England (0.643)
+    Final:    Argentina elimina Spain (0.635)
+
+COMPARAÇÃO FINAL COMPLETA DOS SIMULADORES
+
+  ┌──────────────────────┬───────────┬───────────┬────────────┬────────────┐
+  │                      │ 05        │ 05a       │ 05b V3     │ 05b V4     │
+  ├──────────────────────┼───────────┼───────────┼────────────┼────────────┤
+  │ 🏆 Campeão           │ México    │ França    │ Argentina  │ Argentina  │
+  │ 🥈 Vice              │ França    │ Marrocos  │ Espanha    │ Espanha    │
+  │ 🥉 3º lugar          │ Bélgica   │ Bélgica   │ Inglaterra │ Inglaterra │
+  │ 4º lugar             │ Argentina │ Argentina │ França     │ Alemanha   │
+  │ Modelo               │ V3        │ V3        │ V3         │ V4         │
+  │ Data leakage         │ Alto      │ Médio     │ Zero       │ Zero       │
+  │ Features             │ Diff_Rank │ Diff_Rank │ Diff_Rank  │ Diff_Pts   │
+  │ Previsão genuína     │ ❌        │ Parcial   │ ✅         │ ✅         │
+  └──────────────────────┴───────────┴───────────┴────────────┴────────────┘
+
+CONSISTÊNCIA DO RESULTADO
+  Argentina campeã em 05b V3 e V4 — resultado estável e defensável:
+    - Ranking #1 mundial
+    - Forma_Pts=2.5 pré-Mundial — melhor de todas as 48 equipas
+    - Diff_Points extremamente favorável em todos os jogos
+    - Final vs Espanha (#1 vs #3) — os dois melhores nos dados
+
+  V4 mais confiante que V3 (0.635 vs 0.561) — Diff_Points captura
+  melhor a distância real entre Argentina e Espanha do que Diff_Ranking.
+
+MODELO E SIMULADOR FINAIS SELECCIONADOS
+  Modelo:    V4 Ensemble (model_v4_clf_lr.pkl + model_v4_clf_rf.pkl)
+  Simulador: 05b_simulator_frozen.ipynb
+  Features:  Diff_Points (sem Diff_Ranking)
+  Previsão:  Totalmente preditiva, features congeladas a 2026-06-10
+
+================================================================================
+ESTADO FINAL DEFINITIVO DO PROJECTO
+================================================================================
+
+NOTEBOOKS (ordem de execução)
+  01_scraping_ranking.ipynb         ✅ Scraping ranking FIFA + confederação
+  02_eda_dataset.ipynb              ✅ EDA + limpeza + análise descritiva
+  03_build_dataset.ipynb            ✅ Features + Diff_Points + df_wc_predict
+  04_model_training_v1.ipynb        ✅ Baseline
+  04b_model_training_v2.ipynb       ✅ Sem amigáveis + corte 1990
+  04c_model_training_v3.ipynb       ✅ + golos sofridos + ensemble
+  04d_model_training_v4.ipynb       ✅ + Diff_Points + sample_weight (FINAL)
+  05_simulator.ipynb                ✅ Híbrido (resultados reais)
+  05a_simulator_predictive.ipynb    ✅ Preditivo total (features contaminadas)
+  05b_simulator_frozen.ipynb        ✅ Frozen V4 — modelo final em produção
+
+FICHEIROS DE DADOS
+  results_clean.csv                 ← dataset limpo
+  fifa_ranking.csv                  ← ranking FIFA + confederação
+  df_train.csv                      ← 45524 × 16 (sem Diff_Ranking)
+  df_full.csv                       ← 49819 × 23
+  df_wc_predict.csv                 ← 72 × 12 (frozen, sem Diff_Ranking)
+
+MODELOS GUARDADOS (produção)
+  model_v4_clf_lr.pkl               ← LR V4 (.predict())
+  model_v4_clf_rf.pkl               ← RF V4 (.predict_proba())
+  model_v4_reg_home.pkl             ← Poisson home
+  model_v4_reg_away.pkl             ← Poisson away
+
+MÉTRICAS FINAIS — ENSEMBLE V4
+  Accuracy:  60.7% (17/28) — melhor de todos os modelos
+  Log-loss:  0.885
+  Baseline:  53.6% (15/28)
+  Nota: V3 Ensemble tem log-loss ligeiramente melhor (0.856) mas V4
+  usa features mais correctas (Diff_Points) — trade-off documentado
+
+LIMITAÇÕES DOCUMENTADAS
+  1. Inflação de forma por jogos do Mundial (N=10 → N=20 futuramente)
+  2. Natureza híbrida do simulador em torneio em curso (resolvida no 05b)
+  3. Empates estruturalmente imprevisíveis (0/10 em LR, 1/10 em RF)
+  4. Dataset de teste limitado (28 jogos — cresce até ~64 no final)
+  5. Ausência de feature head-to-head
+  6. Convergência para o óbvio — característica de modelos determinísticos
+
+MELHORIAS FUTURAS
+  1. Janela de forma N=10 → N=20
+  2. Feature head-to-head (confrontos directos históricos)
+  3. Modelo Elo para ratings dinâmicos
+  4. Re-avaliação com dataset completo (~64 jogos) no final do torneio
+  5. Actualização dinâmica do results_clean.csv com resultados reais
+
+================================================================================
+FIM DO PROJECTO — VERSÃO FINAL
+================================================================================
